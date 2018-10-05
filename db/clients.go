@@ -3,9 +3,9 @@ package db
 import (
 	"sync"
 	"time"
+	"fmt"
 	"os"
 	"log"
-	"fmt"
 	"io/ioutil"
 	"encoding/json"
 )
@@ -18,53 +18,25 @@ var FileDb string
 
 var Clients *clientsList
 
-func Init() {
-	Clients = new(clientsList)
-	f, err := os.Create(FileDb)
-	if err != nil {
-		log.Fatalln(fmt.Sprintf("could not to create db file %s, err %s", FileDb, err))
-	}
-	existData, err := ioutil.ReadAll(f)
-	if err != nil {
-		log.Fatalln(fmt.Sprintf("could not read file %s, err %s", FileDb, err))
-	}
-	if len(existData) > 0 {
-		err := json.Unmarshal(existData, Clients.List)
-		if err != nil {
-			log.Println(fmt.Sprintf("could not to unserialize data from file %s, err %s", FileDb, err))
-		}
-	}
-	go func(f *os.File, clients *clientsList) {
-		for {
-			time.Sleep(30 * time.Second)
 
-			data, err := json.Marshal(clients.List)
-			if err != nil {
-				log.Println(fmt.Sprintf("could not to serialize db to file %s, err %s", FileDb, err))
-			} else {
-				if len(data) > 0 {
-					log.Println(fmt.Sprintf("dump db with %d bytes", len(data)))
-					f.WriteAt(data, 0) //write from beginning
-				}
-			}
-		}
-
-	}(f, Clients)
-}
 
 type Command struct {
 	CmdType int `json:"cmd_type"`
 }
 
-type Client struct {
-	m          sync.Mutex
-	Login      string    `json:"login"`
-	Password   string    `json:"password"`
-	DeviceUUID string    `json:"device_uuid"`
-	DeviceName string    `json:"device_name"`
-	Commands   []Command `json:"commands"`
+func (c Command) Equal(cmd Command) bool {
+	return c.CmdType == cmd.CmdType
 }
 
+type Client struct {
+	m            sync.Mutex
+	Login        string     `json:"login"`
+	Password     string     `json:"password"`
+	DeviceUUID   string     `json:"device_uuid"`
+	DeviceName   string     `json:"device_name"`
+	HTTPActiveAt int64      `json:"http_active_at"`
+	Commands     []*Command `json:"commands"`
+}
 type clientsList struct {
 	m    sync.Mutex
 	List []*Client `json:"list"`
@@ -94,7 +66,7 @@ func (c *clientsList) Register(client *Client) error {
 		Password:   client.Password,
 		DeviceUUID: client.DeviceUUID,
 		DeviceName: client.DeviceName,
-		Commands:   make([]Command, 0),
+		Commands:   make([]*Command, 0),
 	})
 	c.m.Unlock()
 	return nil
@@ -110,11 +82,21 @@ func (c *clientsList) Client(l string, p string, uuid string) (*Client, error) {
 }
 
 func (c *clientsList) SendCommand(client *Client, deviceUUID string, cmd Command) error {
+	client.HTTPActiveAt = time.Now().Unix()
 	for _, cl := range c.List {
 		if cl.DeviceUUID == deviceUUID {
 			if cl.Login == client.Login && cl.Password == client.Password {
+				exist := false
+				for _, c := range cl.Commands {
+					if c.Equal(cmd) {
+						exist = true
+					}
+				}
+				if exist {
+					return fmt.Errorf("command already exist")
+				}
 				cl.m.Lock()
-				cl.Commands = append(cl.Commands, cmd)
+				cl.Commands = append(cl.Commands, &cmd)
 				cl.m.Unlock()
 			} else {
 				return fmt.Errorf("you have not permissions for push send to deviceUUID %s", deviceUUID)
@@ -125,28 +107,84 @@ func (c *clientsList) SendCommand(client *Client, deviceUUID string, cmd Command
 	return fmt.Errorf("deviceUUID %s not found", deviceUUID)
 }
 
-func (c *clientsList) FetchCommands(deviceUUID string) ([]Command, error) {
-
+func (c *clientsList) FetchCommands(deviceUUID string) ([]*Command, error) {
 	for _, cl := range c.List {
 		if cl.DeviceUUID == deviceUUID {
 			cl.m.Lock()
-			cmds := make([]Command, 0)
-			for _, v := range cl.Commands {
-				exist := false
-				for _, e := range cmds {
-					if e.CmdType == v.CmdType {
-						exist = true
-					}
-				}
-				if exist == false {
-					cmds = append(cmds, v)
-				}
-			}
-			cl.Commands = make([]Command, 0)
+			cl.HTTPActiveAt = time.Now().Unix()
+			cmds := cl.Commands
+			cl.Commands = make([]*Command, 0)
 			cl.m.Unlock()
 			return cmds, nil
 		}
 	}
-
 	return nil, fmt.Errorf("deviceUUID %s not found, fetch commands fails", deviceUUID)
+}
+
+func (c *clientsList) FetchClients(l string, p string) []*Client {
+	clients := make([]*Client, 0)
+	for _, c := range c.List {
+		if c.Login == l && c.Password == p {
+			clients = append(clients, c)
+		}
+	}
+	return clients
+}
+
+
+func Init() {
+	var (
+		f    *os.File
+		errF error
+	)
+	Clients = &clientsList{}
+	f, errF = os.OpenFile(FileDb, os.O_RDONLY|os.O_CREATE, 0666)
+	if errF != nil {
+		log.Fatalln(fmt.Sprintf("could not to open db file %s, err %s ", FileDb, errF))
+	}
+	existData, err := ioutil.ReadAll(f)
+	if err != nil {
+		log.Fatalln(fmt.Sprintf("could not read file %s, err %s", FileDb, err))
+	}
+	if len(existData) > 0 {
+		err := json.Unmarshal(existData, Clients)
+		if err != nil {
+			log.Println(fmt.Sprintf("could not to unserialize data from file %s, err %s", FileDb, err))
+		}
+	}
+	if Clients.List == nil {
+		Clients.List = make([]*Client, 0)
+	}
+	f.Close()
+	go func(clients *clientsList) {
+		var (
+			f    *os.File
+			errF error
+		)
+		for {
+			func() {
+				time.Sleep(1 * time.Second)
+				f, errF = os.OpenFile(FileDb, os.O_RDWR|os.O_SYNC|os.O_TRUNC, 0666)
+				if errF != nil {
+					log.Fatalln(fmt.Sprintf("could not to open db file %s, err %s ,and err: %s", FileDb, err, errF))
+				}
+				defer f.Close()
+				data, err := json.Marshal(clients)
+				if err != nil {
+					log.Println(fmt.Sprintf("could not to serialize db to file %s, err %s", FileDb, err))
+				} else {
+					if len(data) > 0 {
+						_, err := f.WriteAt(data, 0) //write from beginning
+						if err != nil {
+							log.Println(fmt.Sprintf("could not to write data, err: %s", err))
+						}
+					} else {
+						log.Println("not writed")
+					}
+				}
+			}()
+
+		}
+
+	}(Clients)
 }

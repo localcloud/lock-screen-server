@@ -12,10 +12,44 @@ import (
 
 var serverPort int
 
+type GRequest struct {
+	Auth *AuthData `json:"auth"`
+}
+
 type AuthData struct {
 	Login      string `json:"login"`
 	Password   string `json:"password"`
 	DeviceUUID string `json:"device_uuid"`
+}
+
+func likeMiddleWare(request *http.Request, r interface{}) (*db.Client, error, int) {
+	rawBody, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		return nil, err, http.StatusInternalServerError
+	}
+	err = json.Unmarshal(rawBody, r)
+	if err != nil {
+		return nil, err, http.StatusInternalServerError
+	}
+	rcast := &GRequest{}
+	err = json.Unmarshal(rawBody, rcast)
+	if err != nil {
+		return nil, err, http.StatusInternalServerError
+	}
+	if rcast.Auth == nil {
+		return nil, fmt.Errorf("no auth data"), http.StatusInternalServerError
+	}
+	if !db.Clients.IsRegistered(rcast.Auth.Login, rcast.Auth.Password, rcast.Auth.DeviceUUID) {
+		err = db.Clients.Register(&db.Client{DeviceUUID: rcast.Auth.DeviceUUID, Login: rcast.Auth.Login, Password: rcast.Auth.Password})
+		if err != nil {
+			return nil, err, http.StatusInternalServerError
+		}
+	}
+	client, err := db.Clients.Client(rcast.Auth.Login, rcast.Auth.Password, rcast.Auth.DeviceUUID)
+	if err != nil {
+		return nil, err, http.StatusInternalServerError
+	}
+	return client, nil, http.StatusOK
 }
 
 func main() {
@@ -32,34 +66,14 @@ func main() {
 			ToDeviceUUID string      `json:"to_device_uuid"`
 		}
 		r := &commandPushRequest{}
-		rawBody, err := ioutil.ReadAll(request.Body)
+		client, err, httpStatus := likeMiddleWare(request, r)
 		if err != nil {
-			writer.WriteHeader(http.StatusInternalServerError)
-			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
-			return
-		}
-		err = json.Unmarshal(rawBody, r)
-		if err != nil {
-			writer.WriteHeader(http.StatusInternalServerError)
-			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
-			return
-		}
-		if !db.Clients.IsRegistered(r.Auth.Login, r.Auth.Password, r.Auth.DeviceUUID) {
-			err = db.Clients.Register(&db.Client{DeviceUUID: r.Auth.DeviceUUID, Login: r.Auth.Login, Password: r.Auth.Password})
-			if err != nil {
-				writer.WriteHeader(http.StatusInternalServerError)
-				writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
-				return
-			}
-		}
-		client, err := db.Clients.Client(r.Auth.Login, r.Auth.Password, r.Auth.DeviceUUID)
-		if err != nil {
-			writer.WriteHeader(http.StatusInternalServerError)
+			writer.WriteHeader(httpStatus)
 			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
 			return
 		}
 		err = db.Clients.SendCommand(client, r.ToDeviceUUID, db.Command{CmdType: db.CmdTypeLockScreen})
-		if err != nil{
+		if err != nil {
 			writer.WriteHeader(http.StatusInternalServerError)
 			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
 			return
@@ -67,31 +81,18 @@ func main() {
 		writer.WriteHeader(http.StatusOK)
 		writer.Write([]byte("{\"status\":\"ok\"}"))
 	})
+
 	http.HandleFunc("/command/pull", func(writer http.ResponseWriter, request *http.Request) {
 		defer request.Body.Close()
-		type commandPullRequest struct {
+		type rStruct struct {
 			Auth *AuthData `json:"auth"`
 		}
-		r := &commandPullRequest{}
-		rawBody, err := ioutil.ReadAll(request.Body)
+		r := &rStruct{}
+		_, err, httpStatus := likeMiddleWare(request, r)
 		if err != nil {
-			writer.WriteHeader(http.StatusInternalServerError)
+			writer.WriteHeader(httpStatus)
 			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
 			return
-		}
-		err = json.Unmarshal(rawBody, r)
-		if err != nil {
-			writer.WriteHeader(http.StatusInternalServerError)
-			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
-			return
-		}
-		if !db.Clients.IsRegistered(r.Auth.Login, r.Auth.Password, r.Auth.DeviceUUID) {
-			err = db.Clients.Register(&db.Client{DeviceUUID: r.Auth.DeviceUUID, Login: r.Auth.Login, Password: r.Auth.Password})
-			if err != nil {
-				writer.WriteHeader(http.StatusInternalServerError)
-				writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
-				return
-			}
 		}
 		commands, err := db.Clients.FetchCommands(r.Auth.DeviceUUID)
 		if err != nil {
@@ -108,6 +109,41 @@ func main() {
 		writer.WriteHeader(http.StatusOK)
 		writer.Write(bytesResponse)
 	})
+
+	http.HandleFunc("/clients/list", func(writer http.ResponseWriter, request *http.Request) {
+		defer request.Body.Close()
+		type reqStruct struct {
+			Auth *AuthData `json:"auth"`
+		}
+		type respStruct struct {
+			List []map[string]interface{} `json:"list"`
+		}
+		r := &reqStruct{}
+		client, err, httpStatus := likeMiddleWare(request, r)
+		if err != nil {
+			writer.WriteHeader(httpStatus)
+			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
+			return
+		}
+		resp := &respStruct{List: make([]map[string]interface{}, 0)}
+		for _, cl := range db.Clients.FetchClients(client.Login, client.Password) {
+			newMap := make(map[string]interface{})
+			newMap["device_name"] = cl.DeviceName
+			newMap["device_uuid"] = cl.DeviceUUID
+			newMap["http_active_at"] = cl.HTTPActiveAt
+			resp.List = append(resp.List, newMap)
+		}
+
+		bytesResponse, err := json.Marshal(resp)
+		if err != nil {
+			writer.WriteHeader(http.StatusInternalServerError)
+			writer.Write([]byte(fmt.Sprintf("{\"err\":%s}", err)))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.Write(bytesResponse)
+	})
+
 	log.Fatalln(
 		fmt.Sprintf(
 			"could not to start server on port %d, err: %s",
